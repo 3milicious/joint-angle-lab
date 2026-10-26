@@ -222,15 +222,45 @@ def fit_canvas(img, W, H):
     return canvas
 
 
-def detect(bgr, pose):
+MODEL_URLS = {
+    "full": "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task",
+    "heavy": "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task",
+}
+
+
+def get_model_path(kind):
+    """Download the MediaPipe pose model once and cache it on disk."""
+    import urllib.request
+
+    path = Path(tempfile.gettempdir()) / f"pose_landmarker_{kind}.task"
+    if not path.exists() or path.stat().st_size < 1_000_000:
+        urllib.request.urlretrieve(MODEL_URLS[kind], path)
+    return str(path)
+
+
+def make_landmarker(video):
+    import mediapipe as mp
+
+    opts = mp.tasks.vision.PoseLandmarkerOptions(
+        base_options=mp.tasks.BaseOptions(model_asset_path=get_model_path("full" if video else "heavy")),
+        running_mode=mp.tasks.vision.RunningMode.VIDEO if video else mp.tasks.vision.RunningMode.IMAGE,
+        min_pose_detection_confidence=0.5, min_pose_presence_confidence=0.5, min_tracking_confidence=0.5)
+    return mp.tasks.vision.PoseLandmarker.create_from_options(opts)
+
+
+def detect(bgr, landmarker, ts_ms=None):
+    import mediapipe as mp
+
     h, w = bgr.shape[:2]
     pts, conf = np.full((len(JOINTS), 2), np.nan), np.zeros(len(JOINTS))
-    res = pose.process(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+    rgb = np.ascontiguousarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+    mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    res = landmarker.detect_for_video(mp_img, ts_ms) if ts_ms is not None else landmarker.detect(mp_img)
     if not res.pose_landmarks:
         return pts, conf
-    lm = res.pose_landmarks.landmark
+    lm = res.pose_landmarks[0]
     P = np.array([[l.x * w, l.y * h] for l in lm])
-    V = np.array([l.visibility for l in lm])
+    V = np.array([(l.visibility if l.visibility is not None else 1.0) for l in lm])
     for j, name in enumerate(JOINTS):
         ids = list(JOINT_MP[name])
         pts[j], conf[j] = P[ids].mean(0), V[ids].mean()
@@ -238,8 +268,6 @@ def detect(bgr, pose):
 
 
 def process_uploads(files, stride, max_frames, progress):
-    import mediapipe as mp
-
     tmp = Path(tempfile.mkdtemp(prefix="jal_"))
     vids = [f for f in files if f.name.lower().endswith((".mp4", ".mov", ".avi", ".mkv", ".webm"))]
     frames, times, fps_eff = [], [], None
@@ -275,17 +303,22 @@ def process_uploads(files, stride, max_frames, progress):
 
     H, W = frames[0].shape[:2]
     paths, coords, confs = [], [], []
-    pose = mp.solutions.pose.Pose(static_image_mode=not vids, model_complexity=2 if not vids else 1,
-                                  min_detection_confidence=0.5)
+    progress.progress(0.0, text="Loading pose model (first run downloads it)...")
+    landmarker = make_landmarker(bool(vids))
+    last_ts = -1
     for k, fr in enumerate(frames):
         pth = tmp / f"f{k:05d}.jpg"
         cv2.imwrite(str(pth), fr)
         paths.append(str(pth))
-        pts, cf = detect(fr, pose)
+        ts = None
+        if vids:
+            ts = max(int(times[k] * 1000), last_ts + 1)
+            last_ts = ts
+        pts, cf = detect(fr, landmarker, ts)
         coords.append(pts)
         confs.append(cf)
         progress.progress((k + 1) / len(frames), text=f"Detecting joints: frame {k + 1}/{len(frames)}")
-    pose.close()
+    landmarker.close()
     return {"coords": np.array(coords), "coords0": np.array(coords).copy(), "conf": np.array(confs),
             "times": np.array(times), "w": W, "h": H, "paths": paths, "fps_eff": fps_eff}
 
@@ -507,7 +540,7 @@ with tab_files:
                 st.success("Done. Project created and saved. Go to tab 1.")
                 st.rerun()
             except ImportError:
-                st.error("MediaPipe is not installed: pip install mediapipe")
+                st.error("MediaPipe problem (not installed, or the model could not be downloaded)")
             except Exception as e:  # noqa: BLE001
                 st.error(str(e))
     with c2:
