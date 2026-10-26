@@ -1,0 +1,9 @@
+streamlit
+mediapipe==0.10.14
+opencv-python-headless
+numpy
+pandas
+openpyxl
+matplotlib
+pillow
+streamlit-image-coordinates
