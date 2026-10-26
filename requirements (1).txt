@@ -1,9 +1,0 @@
-streamlit
-mediapipe
-opencv-python-headless
-numpy
-pandas
-openpyxl
-matplotlib
-pillow
-streamlit-image-coordinates
